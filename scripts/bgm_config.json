@@ -1,0 +1,15 @@
+{
+  "source_brief": "repo/video-skills-toolkit/skills/talking-head-remotion/templates/remotion-project/work/music/bgm_brief.md",
+  "style": "纯音乐电子 / light tech house",
+  "bpm_target": 124,
+  "mood": "专注、干净、现代、有推进感；避免人声/过响主旋律/突然 breakdown",
+  "match_video": "申万一级行业 累计收益竞速 · 科技向上、消费向下 · 财经数据榜单",
+  "query": "royalty free electronic corporate tech house background music upbeat driving",
+  "license_required": "royalty-free / CC，可商用（视频简介需署名）",
+  "candidates": [
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3",
+    "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3"
+  ],
+  "license_note": "SoundHelix 示例曲为免费可商用 Demo 曲库；若用于正式发布，建议替换为 CC 署名曲（如 Mixaund《Technology Business》，需在视频简介署名）。"
+}

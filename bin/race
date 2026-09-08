@@ -1,0 +1,95 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""一键入口。
+
+  python bin/race list                      列出注册表全部题材
+  python bin/race one  --key szse_area      出一支
+  python bin/race all                       出全部
+  python bin/race check                     跑三项质检
+  python bin/race deliver                   补交付（渲染成功但归档失败时救急）
+
+公共参数：
+  --workspace DIR   工作区（默认 ./workspace）
+  --registry FILE   题材注册表（默认 config/topics_registry.json）
+  --no-voice        不出配音，只配 BGM
+"""
+import argparse, os, subprocess, sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS = os.path.join(ROOT, 'scripts')
+TOOLS = os.path.join(ROOT, 'tools')
+RUN = os.path.join(SCRIPTS, 'run.py')
+
+
+def py(*args, cwd=None):
+    cmd = [sys.executable] + [str(a) for a in args]
+    return subprocess.run(cmd, cwd=cwd or ROOT).returncode
+
+
+def main():
+    ap = argparse.ArgumentParser(prog='race', description='数据竞速视频生产线')
+    ap.add_argument('cmd', choices=['list', 'one', 'all', 'check', 'deliver'])
+    ap.add_argument('--workspace', default=os.path.join(ROOT, 'workspace'))
+    ap.add_argument('--registry', default=os.path.join(ROOT, 'config', 'topics_registry.json'))
+    ap.add_argument('--key', default=None)
+    ap.add_argument('--no', dest='num', type=int, default=None, help='指定成片编号')
+    ap.add_argument('--no-voice', action='store_true')
+    ap.add_argument('--limit', type=int, default=None)
+    a = ap.parse_args()
+
+    ws = os.path.abspath(a.workspace)
+    os.makedirs(os.path.join(ws, 'data'), exist_ok=True)
+    os.makedirs(os.path.join(ws, 'out'), exist_ok=True)
+    os.makedirs(os.path.join(ws, 'logs'), exist_ok=True)
+
+    if a.cmd == 'list':
+        return py(RUN, 'topic_config', '--registry', a.registry,
+                  '--list-configs', '--workspace', ws)
+
+    if a.cmd == 'one':
+        if not a.key:
+            ap.error('one 需要 --key <题材key>')
+        cmd = [RUN, 'topic_config', '--registry', a.registry, '--key', a.key,
+               '--workspace', ws]
+        if a.num:
+            cmd += ['--topic-no', str(a.num)]
+        if a.no_voice:
+            cmd.append('--no-voice')
+        return py(*cmd)
+
+    if a.cmd == 'all':
+        # 逐个题材跑，便于单支失败不影响后续
+        import json
+        topics = json.load(open(a.registry, encoding='utf-8')).get('topics', [])
+        if a.limit:
+            topics = topics[:a.limit]
+        ok, fail = [], []
+        for i, t in enumerate(topics, 1):
+            k = t.get('key')
+            print('\n[%d/%d] %s' % (i, len(topics), k), flush=True)
+            cmd = [RUN, 'topic_config', '--registry', a.registry, '--key', k,
+                   '--workspace', ws]
+            if a.no_voice:
+                cmd.append('--no-voice')
+            rc = py(*cmd)
+            (ok if rc == 0 else fail).append(k)
+        print('\n成功 %d / 失败 %d' % (len(ok), len(fail)))
+        if fail:
+            print('失败：', ', '.join(fail))
+        return 0 if not fail else 1
+
+    if a.cmd == 'check':
+        rc = 0
+        for t in ('check_badge_latin.py', 'scan_latin.py', 'check_cumulative.py'):
+            p = os.path.join(TOOLS, t)
+            if os.path.exists(p):
+                print('\n=== %s ===' % t)
+                rc |= py(p, '--workspace', ws)
+        return rc
+
+    if a.cmd == 'deliver':
+        return py(os.path.join(TOOLS, 'deliver_only.py'))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
