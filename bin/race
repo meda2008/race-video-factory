@@ -28,7 +28,11 @@ def py(*args, cwd=None):
 
 def main():
     ap = argparse.ArgumentParser(prog='race', description='数据竞速视频生产线')
-    ap.add_argument('cmd', choices=['list', 'one', 'all', 'check', 'deliver'])
+    ap.add_argument('cmd', choices=['list', 'one', 'all', 'check', 'qa', 'deliver'])
+    ap.add_argument('--dir', default=None, help='qa 用：成片目录（默认 D:\\AI视频\\数据竞速）')
+    ap.add_argument('--narr-dir', default=None, help='qa 用：口播稿目录，给了就查 TTS 截断')
+    ap.add_argument('--slug2no', default=None, help='qa 用：题材key→编号 JSON')
+    ap.add_argument('--md', default=None, help='qa 用：额外输出 Markdown 报告')
     ap.add_argument('--workspace', default=os.path.join(ROOT, 'workspace'))
     ap.add_argument('--registry', default=os.path.join(ROOT, 'config', 'topics_registry.json'))
     ap.add_argument('--key', default=None)
@@ -86,6 +90,19 @@ def main():
                 print('\n=== %s ===' % t)
                 rc |= py(p, '--workspace', ws)
         return rc
+
+    if a.cmd == 'qa':
+        # 成片规格体检（时长/声道/采样率/音量/分辨率 + 可选 TTS 截断深检）
+        cmd = [os.path.join(TOOLS, 'qa_delivered.py')]
+        if a.dir:
+            cmd += ['--dir', a.dir]
+        if a.narr_dir:
+            cmd += ['--narr-dir', a.narr_dir]
+        if a.slug2no:
+            cmd += ['--slug2no', a.slug2no]
+        if a.md:
+            cmd += ['--md', a.md]
+        return py(*cmd)
 
     if a.cmd == 'deliver':
         return py(os.path.join(TOOLS, 'deliver_only.py'))

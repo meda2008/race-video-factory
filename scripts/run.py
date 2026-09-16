@@ -14,7 +14,7 @@
   python run.py topic_config --key szse_area --workspace <ws>
   python run.py topic_config --key '*' --workspace <ws>
 """
-import argparse, datetime, os, sys, subprocess, json, time, shutil
+import argparse, datetime, os, sys, subprocess, json, time, shutil, re
 import os.path
 from os.path import dirname, abspath
 
@@ -22,6 +22,11 @@ SCRIPT_DIR = dirname(abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 import imgtable
 import gen_finance_meta
+try:
+    from fit_narration import strip_source
+except Exception:                      # 缺依赖时只是不做来源清洗，不影响出片
+    def strip_source(t):
+        return t
 
 MANAGED_PY = 'C:/Users/medam/.workbuddy/binaries/python/envs/default/Scripts/python.exe'
 
@@ -150,6 +155,19 @@ def ffprobe_dur(p):
         return float(out.decode().strip())
     except Exception:
         return None
+
+
+# 中文播报实测 ≈4.8 字/秒，与 fit_narration.CHARS_PER_SEC / tts.CHARS_PER_SEC 保持一致
+CHARS_PER_SEC = 4.8
+
+
+def _expected_vo_dur(narr_path):
+    """按口播稿字数估算配音应有的时长（秒）。用于 TTS 截断护栏。"""
+    try:
+        n = len(re.sub(r'\s', '', open(narr_path, encoding='utf-8').read()))
+    except OSError:
+        return 0.0
+    return n / CHARS_PER_SEC
 
 
 def step_build(ws, span):
@@ -504,6 +522,17 @@ def _topic_pipeline(ws, slug, norm, post_meta, prompt_default, bg_prompt,
         except Exception as e:
             print('[topic] 口播稿长度定制跳过，沿用原稿：', repr(e))
 
+    # 口播不念"数据来源"（画面右下角已标注）。历史稿子里还有这句，统一在这里清掉，
+    # 放在 TTS 之前，保证连未改写、直接保留的稿子也不会念出来。
+    try:
+        _t = open(narr_path, encoding='utf-8').read()
+        _t2 = strip_source(_t)
+        if _t2 != _t:
+            open(narr_path, 'w', encoding='utf-8').write(_t2 + '\n')
+            print('[topic] 已去掉口播里的「数据来源」段')
+    except Exception as e:
+        print('[topic] 去除数据来源跳过：', repr(e))
+
     yrs = norm['years']
     n = len(yrs)
     span = max(10.0, (n - 1) * 2.5) if n > 1 else 9.0
@@ -531,6 +560,30 @@ def _topic_pipeline(ws, slug, norm, post_meta, prompt_default, bg_prompt,
                 time.sleep(8 * _try)
 
     vo_dur = ffprobe_dur(vo) or 30.0
+
+    # ⚠️ TTS 截断护栏（2026-09-16）：edge-tts 的 WS 被重置后 save() 不报错，
+    # 只写出前面一小段 —— 实测 553 字只出 20.6s，导致整支片被压成 20.7s 交付。
+    # tts.py 内部已按块重试+校验，这里再兜一道：配音远短于口播稿预期就判失败，
+    # 宁可这支失败重跑，也不能把「画面跑完了旁白才念到第 3 句」的残片交付出去。
+    if not no_voice:
+        _exp = _expected_vo_dur(narr_path)
+        if _exp > 10 and vo_dur < _exp * 0.6:
+            for _try in range(1, 3):
+                print('[topic] 配音 %.1fs 远短于预期 %.1fs（TTS 截断），第 %d 次重录'
+                      % (vo_dur, _exp, _try))
+                try:
+                    py('tts.py', '--src', narr_path, '--out', vo, workspace=ws)
+                except Exception as e:
+                    print('[topic] 重录失败：', repr(e))
+                    time.sleep(5 * _try)
+                    continue
+                vo_dur = ffprobe_dur(vo) or vo_dur
+                if vo_dur >= _exp * 0.6:
+                    break
+            if vo_dur < _exp * 0.6:
+                raise RuntimeError('配音时长 %.1fs 远短于口播稿预期 %.1fs（TTS 截断），'
+                                   '已拒绝成片，请重跑本题材' % (vo_dur, _exp))
+
     if not no_voice and vo_dur > MAX_DUR:
         # 口播太长 → 提速重录，把内容完整塞进 2 分钟，而不是截断
         need = min(MAX_RATE, vo_dur / max(1.0, MAX_DUR - 3))
@@ -662,7 +715,7 @@ def main():
     ap.add_argument('--no-ai', action='store_true', help='imgtable 用：强制占位背景（不调 gpt-image-2）')
     ap.add_argument('--voice', action='store_true', help='imgtable 用：生成并叠加 AI 配音')
     ap.add_argument('--duration', type=float, default=12.0, help='imgtable 用：成片时长(秒)')
-    ap.add_argument('--unit', default='%', help='imgtable 用：数值单位（默认 %）')
+    ap.add_argument('--unit', default='%', help='imgtable 用：数值单位（默认 %%）')
     ap.add_argument('--outdir', default=DELIVER_OUTDIR,
                     help='deliver 用：交付目录（默认 D:/AI视频/数据竞速，D 盘不可用时回落 out/增长与分化）')
     ap.add_argument('--title', default=None, help='deliver 用：自定义标题，覆盖 meta')

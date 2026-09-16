@@ -247,7 +247,16 @@ def main():
         'created_at': datetime.now().strftime('%Y-%m-%d %H:%M'),
         'original': rel_src,  # 移动前在 out/ 下的位置，便于追溯
     }
-    man.append(entry)
+    # ⚠️ 重渲染会再次 append：以前是盲目追加，同一支片每重渲一次就多一条，
+    # 实测项目清单 382 条里有 67 组重复（2026-09-16）。按 (编号, 文件名) 去重，
+    # 同键保留最新一条，既不会丢历史也不会膨胀。
+    seen = {}
+    for e in man:
+        if isinstance(e, dict):
+            seen[(str(e.get('no')), str(e.get('file')))] = e
+    seen[(tag, os.path.basename(dest))] = entry
+    man = sorted(seen.values(),
+                 key=lambda e: (str(e.get('no') or ''), str(e.get('file') or '')))
     with open(man_path, 'w', encoding='utf-8') as f:
         json.dump(man, f, ensure_ascii=False, indent=2)
 

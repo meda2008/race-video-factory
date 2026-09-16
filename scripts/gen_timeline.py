@@ -165,6 +165,132 @@ def change_weights(years, inds):
     return w
 
 
+def _to_year(label):
+    """从 '2015' / '1950Q4' / '2004-12' 里取出 4 位年份。"""
+    m = re.search(r'(19|20)\d{2}', str(label))
+    return int(m.group(0)) if m else None
+
+
+def base_timeline(years, dur, intro=0.7, tail_pad=1.5, inds=None):
+    """「变化强度加权」的基础时间轴：每个数据点一个锚点，全程匀速流动。
+
+    这是画面的**主节奏**——保证任何时刻画面都在动，不会因为口播铺垫长而定格。
+    """
+    n = len(years)
+    if n < 2:
+        return []
+    seg = [1.0] * (n - 1)
+    if inds:
+        try:
+            w = change_weights(years, inds)
+            if len(w) == n - 1:
+                seg = [max(1e-9, x) for x in w]
+        except Exception:
+            pass
+    span = max(0.1, dur - tail_pad - intro)
+    tot = sum(seg) or 1.0
+    cum = [0.0]
+    for s in seg:
+        cum.append(cum[-1] + s)
+    return [(round(intro + span * cum[i] / tot, 3), i) for i in range(n)]
+
+
+def speech_anchors(text, years, dur, intro=0.7, tail_pad=1.5):
+    """从口播稿提取 (时刻, idx) 年份锚点——只做提取，不封装首尾。"""
+    n = len(years)
+    if n < 2:
+        return []
+    first_idx = {}
+    for i, y in enumerate(years):
+        yv = _to_year(y)
+        if yv is not None and yv not in first_idx:
+            first_idx[yv] = i
+    if not first_idx:
+        return []
+
+    clean = EMOJI.sub('', text)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    sents = [s.strip() for s in re.split(r'[。！？\n；;]', clean) if s.strip()]
+    total = sum(len(s) for s in sents) or 1
+    span = max(0.1, dur - tail_pad - intro)
+
+    anchors, pos = [], 0
+    for s in sents:
+        t0 = intro + span * pos / total
+        pos += len(s)
+        t1 = intro + span * pos / total
+        # 跳过「从1951到2025」这类总括句：它交代全片范围，不是叙事时刻
+        if re.search(r'(?:从|自)?\s*(?:19|20)\d{2}\s*(?:到|至|—|–|-|~)\s*(?:19|20)\d{2}', s):
+            continue
+        found = [int(m.group(0)) for m in re.finditer(r'(19|20)\d{2}', s)
+                 if int(m.group(0)) in first_idx]
+        if not found:
+            continue
+        if len(found) > 1 and (max(found) - min(found)) > 0.5 * (
+                max(first_idx) - min(first_idx)):
+            continue
+        k = len(found)
+        for j, yv in enumerate(found):
+            anchors.append((t0 + (t1 - t0) * (j + 0.5) / k, first_idx[yv]))
+    if len(anchors) < 2:
+        return []
+
+    mono, prev = [], -1
+    for t, i in anchors:
+        if i < prev:
+            i = prev
+        mono.append((t, i))
+        prev = i
+    return mono
+
+
+def align_speech(text, years, dur, intro=0.7, tail_pad=1.5, inds=None,
+                 max_shift=3.0, alpha=0.6):
+    """音画同步 + 全程流动：**限幅校正**。
+
+    两个坑都踩过：纯口播对齐 → 口播铺垫长时画面死等十几秒；
+    纯日历加权 → 念到 2017 年画面还在 2013 年。
+    所以以基础时间轴为主节奏（全程在动），口播锚点只做限幅校正：
+
+        delta = clamp(t_speech(idx) - t_base(idx), ±max_shift)
+        t(idx) = t_base(idx) + alpha × delta
+    """
+    base = base_timeline(years, dur, intro, tail_pad, inds)
+    if not base:
+        return []
+    anchors = speech_anchors(text, years, dur, intro, tail_pad)
+    if len(anchors) < 2:
+        return base
+
+    def expect(i):
+        if i <= anchors[0][1]:
+            return anchors[0][0]
+        if i >= anchors[-1][1]:
+            return anchors[-1][0]
+        for k in range(len(anchors) - 1):
+            t0, i0 = anchors[k]
+            t1, i1 = anchors[k + 1]
+            if i0 <= i <= i1 and i1 > i0:
+                return t0 + (t1 - t0) * (i - i0) / (i1 - i0)
+        return anchors[-1][0]
+
+    out, last_t = [], intro - 1.0
+    for t_b, i in base:
+        d = expect(i) - t_b
+        if d > max_shift:
+            d = max_shift
+        elif d < -max_shift:
+            d = -max_shift
+        t = t_b + alpha * d
+        if t <= last_t:
+            t = last_t + 0.01
+        out.append((round(t, 3), i))
+        last_t = t
+    print('[gen_timeline] 音画限幅校正：%d 个锚点（口播命中 %d 处，位移上限 ±%.0fs）'
+          % (len(out), len(anchors), max_shift))
+    return out
+
+
 def densify(pts, years, inds, min_step=0.05):
     """在每个锚点区间内按变化强度插入中间年份锚点。
 
@@ -270,9 +396,12 @@ def extract(text, duration, final_year=None, first_year=None, intro=0.7, tail_pa
     total_chars = sum(len(s) for s in sentences) or 1
     dur = duration or 30.0
 
-    # 新：索引空间 + 日历加权（run.py 总会传 years 进来）
+    # 主：基础节奏（全程流动）+ 口播限幅校正（音画同步）
     if years is not None and len(years) >= 2:
-        print('[gen_timeline] 索引空间日历加权 %s→%s（%d 点）'
+        pts = align_speech(text, years, dur, intro, tail_pad, inds)
+        if pts:
+            return pts
+        print('[gen_timeline] 回退日历加权 %s→%s（%d 点）'
               % (years[0], years[-1], len(years)))
         return _index_timeline(years, dur, intro, tail_pad,
                                inds=inds, weight=not _NO_DENSIFY)

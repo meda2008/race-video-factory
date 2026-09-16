@@ -28,12 +28,23 @@
    并在 amix 后保留输出 `-t <dur>` 截断到视频长度。要求 BGM 源长于视频
    （本项目 SoundHelix 曲库 5+ 分钟，视频均 ≤ ~75s，满足）。
 - 无配音时：有 BGM 则铺到 0.22；无 BGM 则 ffmpeg 生成粉噪兜底。
+4. **⚠️ amix 会把输出压成「第一个输入」的声道数**（2026-09-16 实测：68 支成片
+   全是单声道，因为配音是单声道且排在 amix 第一位，BGM 的立体声被丢掉）。
+   所有输入进 amix 前必须先 `aformat=channel_layouts=stereo:sample_rates=48000`。
+5. **⚠️ loudnorm 会把采样率顶到 96kHz**，后面必须跟 `aresample=48000`，
+   否则成片是 96k（部分平台上传会失败）。成片规格：立体声 / 48kHz / -16 LUFS。
 """
 import argparse, os, re, subprocess, glob
 
 FF = "C:/ProgramData/chocolatey/bin/ffmpeg"
 FFPROBE = "C:/ProgramData/chocolatey/bin/ffprobe"
 FPS = 30
+# 成片音频规格：立体声 48kHz、响度 -16 LUFS（短视频平台通用口径）
+AR = "48000"
+AC = "2"
+LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
+# 每个输入进 amix 前统一成 立体声/48k，否则 amix 输出跟随第一个输入（单声道配音）
+AFORMAT = "aformat=channel_layouts=stereo:sample_rates=48000"
 
 
 def run(cmd):
@@ -49,6 +60,21 @@ def _audio_mean_db(path):
     return float(m.group(1)) if m else None
 
 
+def _audio_spec(path):
+    """取成片音频的 (声道数, 采样率)。用于规格自检。"""
+    try:
+        # 必须按 key=value 解析：ffprobe csv 的字段顺序由它自己决定，
+        # 按请求顺序拆会把 声道/采样率 读反（踩过一次）。
+        out = subprocess.check_output(
+            [FFPROBE, '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=channels,sample_rate',
+             '-of', 'default=noprint_wrappers=1', path], text=True)
+        kv = dict(l.split('=', 1) for l in out.splitlines() if '=' in l)
+        return int(kv['channels']), int(kv['sample_rate'])
+    except Exception:
+        return None, None
+
+
 def _check_audio(path, video_dur, vo_dur=None):
     """混音后自检：① 整片平均音量过低 => 疑似静音 bug，拒绝交付；② 配音与视频时长差过大 => 告警。"""
     mean = _audio_mean_db(path)
@@ -60,6 +86,10 @@ def _check_audio(path, video_dur, vo_dur=None):
             f"ERROR 静音自检失败：成片平均音量 {mean:.1f} dB（疑似混音静音 bug），"
             f"已拒绝交付。请检查 BGM 输入是否为原始 mp3（勿用 stream_loop/重编码）与滤镜链。")
     print(f'[mix] 静音自检通过：平均音量 {mean:.1f} dB')
+    ch, sr = _audio_spec(path)
+    if ch is not None:
+        ok = (ch == int(AC) and sr == int(AR))
+        print('[mix] 音频规格：%d 声道 / %d Hz %s' % (ch, sr, '✔' if ok else '✘（期望 2 声道 / 48000 Hz）'))
     if vo_dur is not None and abs(vo_dur - video_dur) > 8:
         print(f'[mix][warn] 配音({vo_dur:.1f}s) 与视频({video_dur:.1f}s) 相差 '
               f'{abs(vo_dur - video_dur):.1f}s，可能头尾留白或截断')
@@ -106,28 +136,39 @@ def main():
     if use_voice and use_bgm:
         # 原始 bgm.mp3 直接喂 sidechaincompress；输出 -t 截到视频长度。
         # 严禁 stream_loop / 重编码（会导致 ~12s 后整条静音，见文件头说明）。
+        # 两路都先 aformat 成立体声 48k，否则 amix 会跟随第一个输入压成单声道。
         run([FF, '-y', '-i', vo, '-i', bgm,
              '-filter_complex',
-             "[0:a]aresample=44100,volume=1.0[voc];"
-             "[1:a]aresample=44100,volume=0.22[bgm];"
+             f"[0:a]{AFORMAT},volume=1.0[voc];"
+             f"[1:a]{AFORMAT},volume=0.22[bgm];"
              "[bgm][voc]sidechaincompress=threshold=0.06:ratio=3.5:attack=15:release=250[duck];"
-             "[voc][duck]amix=inputs=2:duration=longest:normalize=0[out]",
-             '-map', '[out]', '-t', f"{dur}", '-ar', '44100', '-c:a', 'aac', '-b:a', '192k', aud])
+             f"[voc][duck]amix=inputs=2:duration=longest:normalize=0[mx];"
+             f"[mx]{LOUDNORM},aresample={AR}[out]",
+             '-map', '[out]', '-t', f"{dur}", '-ar', AR, '-ac', AC,
+             '-c:a', 'aac', '-b:a', '192k', aud])
     elif use_voice:  # 配音 + 粉噪兜底 BGM
-        run([FF, '-y', '-i', vo, '-f', 'lavfi', '-i', f"anoisesrc=color=pink:duration={dur}:sample_rate=44100",
+        run([FF, '-y', '-i', vo, '-f', 'lavfi', '-i',
+             f"anoisesrc=color=pink:duration={dur}:sample_rate={AR}",
              '-filter_complex',
-             "[0:a]aresample=44100,volume=1.0[voc];"
-             "[1:a]aresample=44100,lowpass=f=1200,volume=0.12[bgm];"
-             "[voc][bgm]amix=inputs=2:duration=longest:normalize=0[out]",
-             '-map', '[out]', '-t', f"{dur}", '-ar', '44100', '-c:a', 'aac', '-b:a', '192k', aud])
+             f"[0:a]{AFORMAT},volume=1.0[voc];"
+             f"[1:a]{AFORMAT},lowpass=f=1200,volume=0.12[bgm];"
+             f"[voc][bgm]amix=inputs=2:duration=longest:normalize=0[mx];"
+             f"[mx]{LOUDNORM},aresample={AR}[out]",
+             '-map', '[out]', '-t', f"{dur}", '-ar', AR, '-ac', AC,
+             '-c:a', 'aac', '-b:a', '192k', aud])
     elif use_bgm:  # 仅 BGM
         run([FF, '-y', '-i', bgm,
-             '-filter_complex', "[0:a]aresample=44100,volume=0.22[a]",
-             '-map', '[a]', '-t', f"{dur}", '-ar', '44100', '-c:a', 'aac', '-b:a', '192k', aud])
+             '-filter_complex',
+             f"[0:a]{AFORMAT},volume=0.22[mx];[mx]{LOUDNORM},aresample={AR}[a]",
+             '-map', '[a]', '-t', f"{dur}", '-ar', AR, '-ac', AC,
+             '-c:a', 'aac', '-b:a', '192k', aud])
     else:  # 纯粉噪兜底
-        run([FF, '-y', '-f', 'lavfi', '-i', f"anoisesrc=color=pink:duration={dur}:sample_rate=44100",
-             '-filter_complex', "lowpass=f=1200,afade=t=in:d=1,afade=t=out:d=2,volume=0.5",
-             '-t', f"{dur}", '-c:a', 'aac', '-b:a', '128k', aud])
+        run([FF, '-y', '-f', 'lavfi', '-i',
+             f"anoisesrc=color=pink:duration={dur}:sample_rate={AR}",
+             '-filter_complex',
+             f"{AFORMAT},lowpass=f=1200,afade=t=in:d=1,afade=t=out:d=2,"
+             f"volume=0.5,{LOUDNORM},aresample={AR}",
+             '-t', f"{dur}", '-ar', AR, '-ac', AC, '-c:a', 'aac', '-b:a', '128k', aud])
 
     run([FF, '-y', '-i', silent, '-i', aud, '-c', 'copy', '-movflags', '+faststart', final])
     print('[mix] DONE ->', final)

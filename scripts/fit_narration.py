@@ -20,11 +20,17 @@ import argparse, json, os, re, sys, time
 CHARS_PER_SEC = 4.8        # 实测：163字→33.5s、758字→151.5s ≈ 4.8~5.0 字/秒
 TOL = 0.18                 # 偏离目标 ±18% 以内不动稿，避免无谓改写
 MIN_DUR, MAX_DUR = 32.0, 105.0
-MIN_CHARS, MAX_CHARS = 140, 520
+MIN_CHARS, MAX_CHARS = 110, 520
 # 时长 = 基础值 + 年度跨度 × 每年秒数。年度跨度越长讲得越久（用户要求），
 # 但仍受 MAX_DUR 封顶，保证单支不超过 2 分钟。
 BASE_SEC = 18.0
 SEC_PER_YEAR = 1.25
+# 数据点极少的题材（如只有 2~3 个年份）不该撑满 MIN_DUR：两点撑 30 秒 =
+# 画面 25 秒不动，观感是「卡住了」。按数据点再封一道顶（2026-09-16）。
+# 2 点→16s、3 点→20s、5 点→30s、11 点→60s；≥13 点的常规题材不受影响。
+SHORT_BASE_SEC = 10.0
+SEC_PER_POINT = 5.0
+MIN_SHORT_DUR = 16.0
 
 
 def year_span(years):
@@ -55,7 +61,15 @@ def target_duration(years, inds=None):
     例：10 年 → 30.5s；33 年 → 59s；70 年 → 105s；124 年 → 105s（封顶）。
     """
     span = year_span(years)
-    return max(MIN_DUR, min(MAX_DUR, BASE_SEC + span * SEC_PER_YEAR))
+    dur = max(MIN_DUR, min(MAX_DUR, BASE_SEC + span * SEC_PER_YEAR))
+    # 数据点太少时再封一道顶：年度跨度可以很大（2015→2025 是 10 年），
+    # 但实际只有 2 个数据点，撑 30 秒就是 25 秒定格。
+    n = len(years or [])
+    if n >= 2:
+        cap = max(MIN_SHORT_DUR, SHORT_BASE_SEC + SEC_PER_POINT * (n - 1))
+        if cap < dur:
+            dur = cap
+    return max(MIN_SHORT_DUR, dur)
 
 
 def digest(years, inds, meta, topk=5, key_years=6):
@@ -121,7 +135,7 @@ PROMPT = """你是财经短视频的口播稿编辑。请基于【真实数据�
 2. **数字取整到好念的位数**：101.72亿 念成"约102亿"，38800 念成"约3.9万"。口播不是报表。
 3. 有对比/反差/反转：谁反超了谁、谁掉队了、差距是拉大还是缩小。要说**具体名字和数字**。
 4. 按时间顺序推进，中间挑 2~4 个关键年份讲变化，不要只讲首尾两年。
-5. 结尾用"数据来源：xxx"收尾（沿用原稿的来源说法）。
+5. **不要念"数据来源"**——来源标注在画面上，口播里念它又啰嗦又打断节奏。
 
 【严禁（出现即不合格）】
 - 空泛感叹/套话：十分醒目、清清楚楚、显而易见、引人注目、不容忽视、值得一提、
@@ -169,7 +183,14 @@ def call_llm(prompt, timeout=180, tries=4):
                                     'messages': [{'role': 'user', 'content': prompt}],
                                     'temperature': 0.7},
                               timeout=timeout)
+            # ⚠️ 非 200 必须抛错让它重试。以前直接 r.json() 取 choices，
+            # 503/429 时拿到空 choices 就静默返回空串 —— 上层只看到「改写结果 0 字」，
+            # 既不重试也不报错，看起来像 LLM 写了篇空稿（2026-09-16）。
+            if r.status_code != 200:
+                raise RuntimeError('LLM HTTP %d: %s' % (r.status_code, r.text[:200]))
             j = r.json()
+            if not j.get('choices'):
+                raise RuntimeError('LLM 返回无 choices：%s' % str(j)[:200])
             return ((j.get('choices') or [{}])[0].get('message') or {}).get('content', '').strip()
         except Exception as e:
             last = e
@@ -183,6 +204,44 @@ def clean(txt):
     txt = re.sub(r'^```[a-zA-Z]*\n?', '', txt)
     txt = re.sub(r'\n?```$', '', txt)
     return txt.strip().strip('"').strip('「').strip('」')
+
+
+SRC_RE = re.compile(r'(?:^|[。！？\n；;])\s*数据来源[：:][^\n。！？]*')
+
+
+def strip_source(text):
+    """删掉口播里的"数据来源：xxx"整句。
+
+    来源标注在画面右下角已经有了，口播再念一遍又啰嗦又拖慢节奏。
+    这是兜底清洗：不管稿子是 LLM 新写的还是历史遗留的，TTS 前统一去掉。
+    """
+    t = SRC_RE.sub('', text)
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    return t
+
+
+def trim_to_target(text, target):
+    """LLM 不可用时的兜底精简：按句从尾往回截，截到最接近 target 的一版。
+
+    只在结果仍不少于 target 的 85% 时才用——截得太狠不如保留原稿。
+    """
+    sents = [s for s in re.split(r'(?<=[。！？])', text) if s.strip()]
+    if len(sents) < 2:
+        return None
+    # 取「最接近 target」的那一刀：不只看不超标的最后一刀，也看超标的第一刀，
+    # 谁的字数离 target 更近用谁（只截 2~3 句的长句稿子，只往下取会截得过狠）。
+    cut, n = 0, 0
+    for i, s in enumerate(sents, 1):
+        cut, n = i, len(re.sub(r'\s', '', ''.join(sents[:i])))
+        if n >= target:
+            break
+    if cut > 1:
+        prev = len(re.sub(r'\s', '', ''.join(sents[:cut - 1])))
+        if abs(prev - target) < abs(n - target):
+            cut, n = cut - 1, prev
+    if n < target * 0.8 or n > target * 1.6:
+        return None
+    return ''.join(sents[:cut]).strip()
 
 
 def main():
@@ -199,7 +258,7 @@ def main():
     d = json.load(open(a.data, encoding='utf-8'))
     years, inds = d.get('years') or [], d.get('industries') or []
     meta = d.get('meta') or {}
-    narr = open(a.src, encoding='utf-8').read().strip()
+    narr = strip_source(open(a.src, encoding='utf-8').read().strip())
 
     dur = min(target_duration(years, inds), a.max_dur)
     target = int(max(MIN_CHARS, min(MAX_CHARS, round(dur * CHARS_PER_SEC))))
@@ -221,12 +280,16 @@ def main():
     try:
         out = clean(call_llm(prompt))
     except Exception as e:
-        print('[fit] LLM 失败，保留原稿：', repr(e))
-        return 1
+        print('[fit] LLM 失败：', repr(e))
+        out = ''
     n2 = len(re.sub(r'\s', '', out))
     if n2 < target * 0.6 or n2 > target * 1.6 or len(out) < 40:
-        print('[fit] 改写结果异常（%d 字），保留原稿' % n2)
-        return 1
+        print('[fit] 改写结果异常（%d 字），改用按句精简兜底' % n2)
+        out = (trim_to_target(narr, target) or '').strip()
+        n2 = len(re.sub(r'\s', '', out))
+        if n2 < target * 0.85:
+            print('[fit] 兜底精简也不达标（%d 字），保留原稿' % n2)
+            return 1
     dst = a.out or a.src
     # 改写前备份原稿（只备一次，避免二次运行把改写稿当成原稿）
     bak = a.src + '.orig'
