@@ -46,7 +46,7 @@ python bin/race all --workspace ./workspace
 | `config/topics_registry.json` | **题材注册表**——新增题材只改这里 |
 | `scripts/` | 流水线各阶段脚本 |
 | `scripts/adapters/` | 数据源适配器（csv / akshare / wdi / owid / szse / nobel） |
-| `tools/` | 质检与运维（成片体检、徽章英文自检、批量重渲染、补交付…） |
+| `tools/` | 质检与运维（成片体检、徽章英文自检、批量重渲染、补交付、历史片音频规格升级…） |
 | `docs/` | 架构、新增题材、数据通道、踩坑记录、质量护栏 |
 
 ## 五条硬规则
