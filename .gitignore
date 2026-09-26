@@ -31,3 +31,9 @@ Thumbs.db
 *.zip
 *.7z
 *.whl
+
+# 临时工作区与重渲日志（不入库）
+workspace_*/
+logs_rerender_*.log
+qa_report*
+qa_result*
